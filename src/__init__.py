@@ -1,4 +1,5 @@
-__all__ = ['Physics', 'CelestialObject']
+__all__ = ['Physics', 'CelestialObject', 'Agent']
 
-from physics import Physics
-from celestial_object import CelestialObject
+from src.physics import Physics
+from src.celestial_object import CelestialObject
+from src.agent import Agent
