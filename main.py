@@ -21,7 +21,7 @@ import torch.optim as optim
 import torch.nn.functional as f
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = "cpu"
+# device = "cpu"
 logging.info(device)
 
 
@@ -67,9 +67,10 @@ def render(satellite):
         forces = {}
         for obj in CelestialObject.objects:
             force = obj.calculate_total_force(CelestialObject.objects)
-            forces[obj] = force
+            forces[obj] = (force[0], force[1])
 
         for obj, force in forces.items():
+            # print(force)
             obj.update_position(*force)
             obj.draw(window, panning_offset[0], panning_offset[1], True, (screen_width, screen_height), scaling_factor)
 
@@ -114,17 +115,32 @@ class SatelliteEnvironment(gym.Env):
 
         initialize_objects()
         # self.action_space = gym.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32) # moze discrete
-        self.action_space = gym.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.integer)
+        self.action_space = gym.spaces.Box(low=0, high=8, shape=(1,), dtype=np.integer)
         earth = next((obj for obj in Physics.objects if obj.name.lower() == 'earth'), None)
+        self.fuel_capacity = 4000
         self.satellite = Agent(name="Satellite", pos=[0.002 * Physics.AU, 0], radius=0.0068, color=(255, 128, 255),
                                mass=1000,  # moze 6kh
-                               initial_velocity=[0, 1022], parent=earth, fuel_capacity=10000, target=target)
+                               initial_velocity=[0, 1022], parent=earth, fuel_capacity=self.fuel_capacity,
+                               target=target)
+        self.target = target
         self.screen = None
         self.panning = False
         self.panning_offset = 0, 0
         self.panning_start = [0, 0]
         self.scaling_factor = 1
         self.tol = 2137  # km
+        self.reward_n = 120
+        self.action_map: typing.Dict = {
+            0: [0, 0],
+            1: [1, 0],
+            2: [1, 1],
+            3: [0, 1],
+            4: [-1, 0],
+            5: [-1, -1],
+            6: [0, -1],
+            7: [-1, 1],
+            8: [1, -1]
+        }
 
     def reset(
             self,
@@ -137,7 +153,8 @@ class SatelliteEnvironment(gym.Env):
         earth = next((obj for obj in Physics.objects if obj.name.lower() == 'earth'), None)
         self.satellite = Agent(name="Satellite", pos=[0.002 * Physics.AU, 0], radius=0.0068, color=(255, 128, 255),
                                mass=1000,  # moze masa z 6kg
-                               initial_velocity=[0, 1022], parent=earth, fuel_capacity=10000)
+                               initial_velocity=[0, 1022], parent=earth, fuel_capacity=self.fuel_capacity,
+                               target=self.target, window=self.screen)
         # self.screen = None
         self.panning = False
         self.panning_offset = 0, 0
@@ -193,7 +210,9 @@ class SatelliteEnvironment(gym.Env):
         return [self.satellite.target, pos, np.array([fuel]), np.array([fx, fy]), self.satellite.velocity]
 
     def step(self, action: ActType) -> Tuple[ObsType, float, bool, bool, dict]:
-        self.satellite.set_thrust_direction([action[0], action[1]])
+        # print(action)
+        mapped_action = self.action_map[action]
+        self.satellite.set_thrust_direction(mapped_action)
         forces = {}
         for obj in CelestialObject.objects:
             force = obj.calculate_total_force(CelestialObject.objects)
@@ -216,10 +235,14 @@ class SatelliteEnvironment(gym.Env):
         r, dist = self.reward()  # reward
         d = dist < self.tol * 1000  # done
         collision = self.satellite.collision(distances)
-        t = collision or self.satellite.fuel_level <= 0
+        # print(dist)
+        # print(dist / Physics.AU)
+        # print(dist / Physics.AU > 20)
+        t = collision or self.satellite.fuel_level <= 0 or (dist / Physics.AU > 20)
         state = [distances]
         state.extend(self.get_current_state())
         padded_state = [np.pad(arr, (0, 12 - len(arr)), mode='constant') for arr in state]
+        d = d or t
         # (observation, reward, terminated, truncated, info)
         data = {
             'distances': distances,
@@ -227,20 +250,27 @@ class SatelliteEnvironment(gym.Env):
             'terminated': d,
             'reward': r,
             'collision': collision,
-            'fuel': self.satellite.fuel_level
+            'fuel': self.satellite.fuel_level,
+            'distance_to_target': dist
         }
         # return [6, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], r, d, t, data
         return padded_state, r, d, t, data
 
     def reward(self):
-        # todo....
-        # funkcja odleglosci potencjalnej orbity od dystansu?????
         distance_to_target = self.satellite.distance_to_target()
         fuel_consumed = self.satellite.fuel_capacity - self.satellite.fuel_level
-        distance_reward = 1 / distance_to_target if distance_to_target > 0 else 0
+        distance_reward = 1 / (distance_to_target / Physics.AU) if distance_to_target > self.tol * 1000 else 100
+        next_orbit = self.satellite.simulate_next(100)
+        distances = np.linalg.norm(next_orbit - np.array(self.target), axis=1)
+        closest_point = distances[np.argmin(distances)]
+        orbit_reward = 4 / (closest_point / Physics.AU) if closest_point > self.tol * 1000 else 200
+        print(f'r: {orbit_reward}')
+        print(f't: {np.array(self.target) / Physics.AU}')
+        print(f'c: {closest_point / Physics.AU}')
+        # print(distance_reward)
         fuel_penalty = fuel_consumed * 0
         out_of_fuel_penalty = -100 if self.satellite.fuel_level <= 0 else 0
-        total_reward = distance_reward - fuel_penalty + out_of_fuel_penalty
+        total_reward = orbit_reward + distance_reward - fuel_penalty + out_of_fuel_penalty
         return total_reward, distance_to_target
 
 
@@ -300,7 +330,7 @@ class EpsilonGreedyStrategy:
 
     def get_exploration_rate(self, current_step):
         return self.end + (self.start - self.end) * \
-            np.exp(-1. * current_step * self.decay)
+               np.exp(-1. * current_step * self.decay)
 
 
 class Action:
@@ -316,11 +346,14 @@ class Action:
 
         if rate > random.random():
             action = self.env.action_space.sample()
-            return torch.tensor([[action]]).to(device)
+            return torch.tensor([action]).to(device)
         else:
             with torch.no_grad():
-                action = policy_net(state).max(1).indices.view(-1, 1, 2)
-                print(action)
+                # print('----')
+                # print(state.shape)
+                # print(state)
+                action = policy_net(state).max(1).indices.view(1, 1)
+                # print(action)
                 return action
 
 
@@ -329,7 +362,7 @@ def main():
     target = np.add([2.53 * Physics.AU, 0], sun_pos)
     env = SatelliteEnvironment(target=target)
     num_episodes = 500
-    n_actions = 2
+    n_actions = 1
     n_observations = 12
     batch_size = 128
     gamma = 0.99
@@ -343,7 +376,6 @@ def main():
     target_net = DQN(n_observations, n_actions).to(device)
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
-
     optimizer = optim.AdamW(policy_net.parameters(), lr=lr)
     memory = ReplayMemory(memory_size)
     strategy = EpsilonGreedyStrategy(eps_start, eps_end, eps_decay)
@@ -363,6 +395,7 @@ def main():
     # Training loop
     for episode in range(num_episodes):
         state, data = env.reset()
+        # print(np.array(state).shape)
         state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         done = False
         episode_reward = 0
@@ -370,10 +403,11 @@ def main():
         while not done:
             # state = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
             action = agent.select_action(state, policy_net)
-            print(action)
+            # print(action)
             # print(f'action: {action[0]}')
-            next_state, reward, done, _, __ = env.step(action[0][0].cpu().numpy())
+            next_state, reward, done, _, __ = env.step(action.item())
             next_state = torch.tensor(next_state, dtype=torch.float32).unsqueeze(0).to(device)
+            # print(state)
             # state, r, d, t, data
             # print(reward)
             episode_reward += reward
@@ -391,16 +425,17 @@ def main():
                 print("Shapes of states and actions tensors:")
                 print("States:", states.shape)
                 print("Actions:", actions.shape)
-
-                current_q_values = policy_net(states).gather(dim=1, index=actions)
-                next_q_values = target_net(next_states).max(dim=1)[0].detach()
+                # actions = actions.view(-1, 1)
+                current_q_values = policy_net(states)  # .gather(dim=1, index=actions)
+                with torch.no_grad():
+                    next_q_values = target_net(next_states).max(dim=1)[0].detach()
                 target_q_values = rewards + gamma * next_q_values
 
                 loss = f.smooth_l1_loss(current_q_values, target_q_values.unsqueeze(1))
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-            # env.render()
+            env.render()
         if episode % 10 == 0:
             target_net.load_state_dict(policy_net.state_dict())
 
@@ -412,5 +447,4 @@ def main():
 if __name__ == '__main__':
     main()
     # random_mov()
-# main()
-
+    # main()

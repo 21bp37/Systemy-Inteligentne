@@ -8,7 +8,7 @@ import numpy as np
 class Physics:
     AU = 149.6e6 * 1000  # m
     G = 6.67428e-11
-    TIMESTEP = 2 * 1800 * 24 * 1 * 1
+    TIMESTEP = 2 * 1800 * 24 * 1 * 2
     SCALE = 60 / AU  # 40px - 1au
     objects = []
 
